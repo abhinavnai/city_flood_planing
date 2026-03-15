@@ -534,7 +534,8 @@ Remember: Getting coordinates is just step 1. You must continue with more tools!
     
     return {"messages": [response], "current_step": "model_called"}
 
-
+##importing this for parallel execution
+from concurrent.futures import ThreadPoolExecutor, as_completed
 def execute_tools(state: AgentState):
     """Node that executes tool calls from the model."""
     messages = state["messages"]
@@ -561,41 +562,35 @@ def execute_tools(state: AgentState):
     
     # Execute each tool call
     tool_messages = []
-    for idx, tool_call in enumerate(last_message.tool_calls, 1):
-        tool_name = tool_call["name"]
-        tool_args = tool_call["args"]
-        tool_id = tool_call["id"]
-        
-        # Print tool execution
-        print(f"\n        [{idx}] Executing: {tool_name}")
-        if tool_args:
-            for key, value in tool_args.items():
-                # Truncate long values for readability
-                display_value = str(value)[:50] + "..." if len(str(value)) > 50 else value
-                print(f"            - {key}: {display_value}")
-        
-        if tool_name in tools_map:
-            tool_func = tools_map[tool_name]
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_tool = {
+            executor.submit(tools_map[tool_call["name"]].invoke, tool_call["args"]) : tool_call
+            for tool_call in last_message.tool_calls
+            if tool_call["name"] in tools_map
+        }
+        for future in as_completed(future_to_tool):
+            tool_call = future_to_tool[future]
+            tool_id = tool_call["id"]
+            tool_name = tool_call["name"]
+
             try:
-                print(f"            Status: Processing...")
-                result = tool_func.invoke(tool_args)
-                print(f"            Status: SUCCESS")
+                result = future.result()
                 tool_messages.append(
                     ToolMessage(
-                        content=str(result),
-                        tool_call_id=tool_id,
-                        name=tool_name
+                        content = str(result),
+                        tool_call_id = tool_id,
+                        name = tool_name,
                     )
                 )
             except Exception as e:
-                print(f"            Status: FAILED - {str(e)[:100]}")
                 tool_messages.append(
                     ToolMessage(
-                        content=f"Error executing {tool_name}: {str(e)}",
-                        tool_call_id=tool_id,
-                        name=tool_name
+                        content = f"Error Executing {tool_name} due to {e}",
+                        tool_call_id = tool_id,
+                        name = tool_name,
                     )
                 )
+    
     
     print(f"\n[TOOLS] Completed execution of {len(tool_messages)} tool(s)")
     
