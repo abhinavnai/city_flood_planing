@@ -1,0 +1,119 @@
+﻿Prompt
+	Output Example
+	Tools/Data Required
+	Which residential areas in Jodhpur will lose hospital access within a 10-minute drive if the current flood scenario continues for the next 12 hours?
+	Table and interactive map highlighting affected neighborhoods, estimated impacted population, vulnerability breakdown, and alternative hospital routes/live updates.
+	OSM Free API (roads, hospitals), Bhuvan Flood Raster API, Bhuvan Routing API, LangGraph Agent Orchestration
+	Rank the top 5 schools in Jodhpur most at risk of being cut off due to current flooding. Also, provide emergency shelter alternatives within a 15-minute walk for each.
+	Ranked risk list of schools, geolocated shelters, best walking routes.
+	 OSM Free API (schools, shelters, roads),
+ Bhuvan Flood Raster API,
+Bhuvan Routing API,
+ LangGraph
+	Find all POIs (hospitals, fire stations, pharmacies) currently unreachable by ambulances due to water depth exceeding their safe operational limits.
+	Map/list of stranded facilities, nearest accessible depots, travel distance/time, and resource allocation recommendations (e.g deploy rescue boats).
+	 OSM Free API (POIs, roads)
+ Bhuvan Flood Raster (depth data)
+ Routing API
+ LangGraph
+	Identify the best land plots for new hospitals to maximize 10-minute access during monsoon floods.
+	Ranked list of candidate plots, isochrone maps, population-benefit matrices, zoning/environmental checklists, and compliance status.
+	OSM Free API (land use, roads, population),
+ Bhuvan Flood Raster,
+ Routing API,
+ LangGraph
+	For all population groups with <50% pharmacy access within a 10-minute walk due to current flood, generate automated outreach messages for city officials and affected residents.
+	Targeted WhatsApp/SMS/email templates, area-resident lists, and visualization of service access gaps for decision-makers.
+	OSM POIs (pharmacies),
+ Bhuvan Flood Raster,
+ LangGraph 
+	If the water level in Luni river rises by 2 meters within 2 hours, which parts of Jodhpur will require immediate evacuation and which shelters have enough capacity?
+	Evacuation priority list per ward, shelter assignments, travel/ETA analytics, live occupancy status, with notification triggers.
+	 Bhuvan Flood API
+ OSM Roads + Shelters
+ Routing API
+ LangGraph
+	Identify the top 3 locations (land plots) available for mobile healthcare camps in areas currently underserved and inaccessible due to ongoing floods.
+	Site recommendations with coordinates, population need analytics, access route info, expected dry time windows, and camp readiness reports.
+	OSM Land Use + Roads
+ Bhuvan Flood Raster
+ LangGraph
+	Summarize all population centers that have remained unserved by pharmacies or hospitals for more than 48 hours due to any hazard in the last month.
+	Tabular/text report with maps of outages, timeline and frequency analysis, and recommendations for future response improvements.
+	OSM POIs + Population
+ Bhuvan Flood API
+ Pinecone (RAG historical data)
+ LangGraph
+	Generate daily situation summary for Jodhpur’s flood, listing key accessibility incidents, service disruptions, mitigated hazards, and agent actions taken.
+	Human- and machine-readable summary, chart/infographic, incident map, and action log for city managers.
+	Bhuvan Flood API
+ OSM City Data
+ Pinecone (RAG memory)
+ LangGraph
+	Show all wards in Jodhpur where at least 25% of the population lived more than 15 minutes from a hospital before the flood, and now more than 75%.
+	List of affected wards, shift graphs, region polygons, and official comms drafts for awareness and mitigation planning.
+	OSM POIs (hospitals), Roads
+ Flood Raster API
+ LangGraph
+	
+
+
+
+
+
+
+
+Tools 
+
+
+
+
+Data/Tool
+	API/ docs
+	How to Use & Integrate
+	OSM Map/Roads
+	OSM Free API
+	Fetch city map, POIs, roads via REST API or extract .osm file. Use Python/JS or QGIS/pgRouting.
+	Flood Rasters
+	Bhuvan Disaster Portal
+	Download up-to-date flood rasters during events; use WMS/WFS in GIS .
+	Routing Tool
+	Guide, Bhuvan routing api
+	calculate shortest path.
+	Vector DB (RAG)
+	Pinecone 
+	Create vector index, upload docs/vectors, query by embeddings for context or semantic search.
+	Agent Orchestration
+	LangGraph Docs
+	Design agent workflows in Python, connect with APIs, memory, tools.
+	
+
+
+
+API and their purpose:
+
+
+Nominatim API (Open Street map)  Link
+
+* Purpose: Geocoding (convert place names to coordinates) & reverse geocoding (coordinates to addresses).
+
+* Used for: Finding the location and bounding box of “Jodhpur” or other cities/wards mentioned in prompts.
+
+
+
+
+Bhuvan Disaster API (external; flood/risk data)
+
+   * Purpose: Provides real-time disaster layers such as flood extent maps.
+
+   * Used for: Overlaying flood areas on top of the OSM map to assess impacts.
+
+
+Overpass API
+      * Purpose: Query OpenStreetMap data using filters (e.g., hospitals, roads, buildings).
+
+      * Used for:
+
+         * Fetching POIs like hospitals, schools, shelters.
+
+         * Getting road networks, land use, administrative boundaries, and building footprints.
