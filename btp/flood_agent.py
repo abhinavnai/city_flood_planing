@@ -449,273 +449,285 @@ def check_vehicle_passability(lat: float, lon: float, vehicle_type: str = "car")
     
     except Exception as e:
         return f"Error checking vehicle passability: {str(e)}"
-
-# ============================================================================
-# STATE
-# ============================================================================
-
 class AgentState(TypedDict):
-    messages: Annotated[list, add_messages]
-    initial_query: str
-    plan: Optional[list]          # structured plan from planner
-    current_step: str
-    is_satisfied: bool
-
+    messages:       Annotated[list, add_messages]
+    initial_query:  str
+    plan:           list        # full ordered list of steps — written once by planner
+    current_step_index: int     # which step the executor is currently on
+    current_step:   str
 
 # ============================================================================
-# PROMPTS
+# UPDATED PLANNER PROMPT — marks parallel groups
 # ============================================================================
 
 PLANNER_PROMPT = PromptTemplate(
-    input_variables=["initial_query", "messages"],
+    input_variables=["initial_query"],
     template="""
-You are a PLANNING AGENT for a Flood Disaster Assistance System.
+You are a PLANNING AGENT for a Flood Disaster Assistance System (Jodhpur, Rajasthan).
 
-Analyze the conversation history:
-{messages}
+User request: {initial_query}
 
-User's original request:
-{initial_query}
+Produce a COMPLETE execution plan. Group independent steps that can run simultaneously
+into the same "group" number. Steps that depend on a previous step's output must have
+a higher group number.
 
----
-STEP 1 — Check if the request is already fully satisfied by previous tool results.
-
-If YES, return EXACTLY:
-{{
-  "status": "satisfied",
-  "reason": "<why the request is already answered>"
-}}
-
-If NO, create a step-by-step execution plan using ONLY these tools:
-  1. get_coordinates_from_location  — convert place names to coordinates
+AVAILABLE TOOLS:
+  1. get_coordinates_from_location  — convert a place name to lat/lon
   2. search_amenity                 — find hospitals, shelters, police stations, etc.
-  3. check_amenity_flood_status     — check if a facility is flooded or safe
+  3. check_amenity_flood_status     — check if a specific facility is flooded
   4. check_route_flood_safety       — check if a route between two points is safe
-  5. check_vehicle_passability      — check if a vehicle can pass through flood water
-  6. check_flood_depth              — get flood depth at specific coordinates
+  5. check_vehicle_passability      — check if a vehicle type can pass flood water
+  6. check_flood_depth              — get flood depth at coordinates
   7. get_flooded_areas              — list all currently flooded zones
 
-PLANNING RULES:
-- Always resolve place names to coordinates before any geographic analysis.
-- Always verify flood safety of facilities before recommending them.
-- Always verify route safety before suggesting a route.
-- Check vehicle passability if any vehicle is mentioned.
-- Avoid redundant tool calls.
-- Each step must logically build on the previous one.
+GROUPING RULES:
+- Same group number = runs in PARALLEL (no dependency on each other).
+- Higher group number = runs AFTER all steps in the previous group finish.
+- get_coordinates_from_location must always be group 1 if place names are present.
+- Any tool that needs coordinates must be in a group AFTER the coordinates step.
+- Tools that are fully independent of each other (e.g. get_flooded_areas and
+  get_coordinates_from_location) can share the same group.
 
-Return EXACTLY:
+EXAMPLE for "find safe hospital near Sardarpura and check if ambulance can pass":
+  group 1 (parallel): get_coordinates_from_location(Sardarpura), get_flooded_areas
+  group 2 (parallel): search_amenity(hospitals), check_flood_depth(coords)
+  group 3 (parallel): check_amenity_flood_status(hospital_1), check_amenity_flood_status(hospital_2)
+  group 4 (sequential): check_route_flood_safety(safe hospital)
+  group 5 (sequential): check_vehicle_passability(ambulance, route)
+
+OUTPUT — return ONLY valid JSON, no markdown fences:
 {{
-  "status": "planning_required",
   "plan": [
     {{
+      "group": 1,
       "step": 1,
       "tool": "<tool_name>",
-      "purpose": "<why>",
-      "input": "<what to pass>",
-      "expected_output": "<what the tool will return>"
+      "purpose": "<one sentence why>",
+      "input_description": "<what to pass>"
+    }},
+    {{
+      "group": 1,
+      "step": 2,
+      "tool": "<tool_name>",
+      "purpose": "<one sentence why>",
+      "input_description": "<what to pass>"
+    }},
+    {{
+      "group": 2,
+      "step": 3,
+      "tool": "<tool_name>",
+      "purpose": "<one sentence why>",
+      "input_description": "<what to pass>"
     }}
   ]
 }}
 """
 )
 
+
+# ============================================================================
+# UPDATED EXECUTOR PROMPT — for a single tool call within a parallel batch
+# ============================================================================
+
 EXECUTOR_PROMPT = PromptTemplate(
-    input_variables=["initial_query", "messages", "plan"],
+    input_variables=["initial_query", "tool_name", "purpose", "input_description", "previous_results"],
     template="""
 You are a FLOOD DISASTER EXECUTION AGENT for Jodhpur, Rajasthan.
 
-Original user request:
-{initial_query}
+Original user request: {initial_query}
 
-Current conversation/tool results so far:
-{messages}
+Results from previous tool calls (already completed):
+{previous_results}
 
-Planner's step-by-step plan to follow:
-{plan}
+YOUR CURRENT TASK:
+  Tool     : {tool_name}
+  Purpose  : {purpose}
+  Input hint: {input_description}
 
----
-EXECUTION RULES:
-
-1. Follow the plan in order. Execute only the NEXT uncompleted step.
-2. Do NOT skip steps or jump ahead.
-3. After each tool call, the results will be fed back for the next iteration.
-4. Do NOT answer the user directly — only make the required tool calls.
-
-AVAILABLE TOOLS:
-- get_coordinates_from_location
-- search_amenity
-- check_amenity_flood_status
-- check_route_flood_safety
-- check_vehicle_passability
-- check_flood_depth
-- get_flooded_areas
-
-Now execute the next required tool call from the plan.
+Using the previous results to resolve any arguments, call EXACTLY the tool "{tool_name}".
+Do NOT call any other tool. Do NOT write a final answer — only the tool call.
 """
 )
 
 
 # ============================================================================
-# NODES
+# HELPERS
+# ============================================================================
+
+def _collect_tool_results(messages: list) -> str:
+    parts = []
+    for m in messages:
+        if isinstance(m, ToolMessage):
+            parts.append(f"[{m.name}]: {m.content}")
+    return "\n".join(parts) if parts else "No results yet."
+
+def _make_model(with_tools: bool = False):
+    model = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        temperature=0,
+        google_api_key=os.getenv("GOOGLE_API_KEY"),
+    )
+    return model.bind_tools(list(TOOLS_MAP.values())) if with_tools else model
+
+def _parse_json(text: str) -> dict:
+    clean = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
+    return json.loads(clean)
+
+def _get_groups(plan: list) -> list[list]:
+    """
+    Returns plan steps grouped by their 'group' number, ordered ascending.
+    Each inner list is one batch of steps that can run in parallel.
+    """
+    from itertools import groupby
+    sorted_plan = sorted(plan, key=lambda s: s["group"])
+    return [list(steps) for _, steps in groupby(sorted_plan, key=lambda s: s["group"])]
+
+
+# ============================================================================
+# NODE 1 — PLANNER  (runs exactly once)
 # ============================================================================
 
 def planner_node(state: AgentState) -> AgentState:
-    """
-    Checks if the user's request is satisfied.
-    If not, creates a structured plan and stores it in state.
-    """
-    messages   = state["messages"]
-    query      = state["initial_query"]
-
-    model = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        temperature=0,
-        google_api_key=os.getenv("GOOGLE_API_KEY")
-    )
-
-    chain    = PLANNER_PROMPT | model
-    response = chain.invoke({"initial_query": query, "messages": messages})
-
-    # Parse JSON from the model response
-    try:
-        raw  = response.content.strip()
-        # strip markdown fences if present
-        raw  = re.sub(r"```(?:json)?", "", raw).strip().rstrip("```").strip()
-        data = json.loads(raw)
-    except (json.JSONDecodeError, AttributeError):
-        data = {"status": "planning_required", "plan": []}
-
-    is_satisfied = data.get("status") == "satisfied"
-    plan         = data.get("plan", [])
-#helper function to print the plan in a readable format
-    print(f"\n[PLANNER] Status: {'SATISFIED ✓' if is_satisfied else 'PLANNING REQUIRED'}")
-    if not is_satisfied:
-        for step in plan:
-            print(f"  Step {step['step']}: {step['tool']} — {step['purpose']}")
-
-    return {
-        **state,
-        "messages":     messages + [response],
-        "plan":         plan,
-        "is_satisfied": is_satisfied,
-        "current_step": "planner_done",
-    }
-
-
-def tool_executor_node(state: AgentState) -> AgentState:
-    """
-    Validates the plan and invokes the LLM with tools bound,
-    so the LLM can select and call the correct tool for the current step.
-    """
-    messages = state["messages"]
     query    = state["initial_query"]
-    plan     = state.get("plan", [])
+    chain    = PLANNER_PROMPT | _make_model()
+    response = chain.invoke({"initial_query": query})
 
-    model = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        temperature=0,
-        google_api_key=os.getenv("GOOGLE_API_KEY")
-    )
+    try:
+        data = _parse_json(response.content)
+        plan = data.get("plan", [])
+    except (json.JSONDecodeError, AttributeError):
+        plan = []
 
-    tools_list = [
-        search_amenity,
-        get_city_bbox,
-        get_coordinates_from_location,
-        calculate_route,
-        check_flood_depth,
-        get_flooded_areas,
-        check_amenity_flood_status,
-        check_route_flood_safety,
-        check_vehicle_passability,
-    ]
-    model_with_tools = model.bind_tools(tools_list)
-
-    # Build the executor prompt
-    prompt_text = EXECUTOR_PROMPT.format(
-        initial_query=query,
-        messages=messages,
-        plan=json.dumps(plan, indent=2),
-    )
-
-    print("\n[EXECUTOR] Selecting next tool from plan...")
-    response = model_with_tools.invoke([HumanMessage(content=prompt_text)])
-
-    if hasattr(response, "tool_calls") and response.tool_calls:
-        print(f"[EXECUTOR] Calling {len(response.tool_calls)} tool(s):")
-        for tc in response.tool_calls:
-            args_preview = ", ".join(
-                f"{k}={str(v)[:40]}" for k, v in list(tc.get("args", {}).items())[:2]
-            )
-            print(f"  → {tc['name']}({args_preview})")
-    else:
-        print("[EXECUTOR] No tool calls generated.")
+    groups = _get_groups(plan)
+    print(f"\n[PLANNER] {len(plan)} steps across {len(groups)} group(s):")
+    for g in groups:
+        names = [s["tool"] for s in g]
+        label = "parallel" if len(g) > 1 else "sequential"
+        print(f"  Group {g[0]['group']} ({label}): {', '.join(names)}")
 
     return {
         **state,
-        "messages":     messages + [response],
-        "current_step": "executor_done",
+        "messages":            state["messages"] + [response],
+        "plan":                plan,
+        "current_group_index": 0,
+        "current_step":        "planner_done",
     }
 
 
-def tool_caller_node(state: AgentState) -> AgentState:
+# ============================================================================
+# SINGLE-TOOL EXECUTOR  (used inside the parallel worker)
+# ============================================================================
+
+def _execute_single_step(step: dict, initial_query: str, previous_results: str) -> list:
     """
-    Executes every pending tool call in the last message
-    and appends ToolMessage results back into state.
+    Asks the LLM to make exactly one tool call, runs it, and returns
+    the resulting messages [AIMessage, ToolMessage].
+    Runs in a thread — must be stateless.
     """
-    messages     = state["messages"]
-    last_message = messages[-1]
+    prompt_text = EXECUTOR_PROMPT.format(
+        initial_query=initial_query,
+        tool_name=step["tool"],
+        purpose=step["purpose"],
+        input_description=step["input_description"],
+        previous_results=previous_results,
+    )
 
-    if not (hasattr(last_message, "tool_calls") and last_message.tool_calls):
-        return {**state, "current_step": "no_tools"}
+    model_with_tools = _make_model(with_tools=True)
+    llm_response     = model_with_tools.invoke([HumanMessage(content=prompt_text)])
+    new_messages     = [llm_response]
 
-    tools_map = {
-        "search_amenity":              search_amenity,
-        "get_city_bbox":               get_city_bbox,
-        "get_coordinates_from_location": get_coordinates_from_location,
-        "calculate_route":             calculate_route,
-        "check_flood_depth":           check_flood_depth,
-        "get_flooded_areas":           get_flooded_areas,
-        "check_amenity_flood_status":  check_amenity_flood_status,
-        "check_route_flood_safety":    check_route_flood_safety,
-        "check_vehicle_passability":   check_vehicle_passability,
-    }
-
-    print("\n[TOOL CALLER] Executing tools...")
-    tool_messages = []
-
-    for idx, tc in enumerate(last_message.tool_calls, 1):
-        name    = tc["name"]
-        args    = tc["args"]
-        call_id = tc["id"]
-
-        print(f"  [{idx}] {name}")
-        if name in tools_map:
+    if hasattr(llm_response, "tool_calls") and llm_response.tool_calls:
+        for tc in llm_response.tool_calls:
+            tool_fn = TOOLS_MAP.get(tc["name"])
             try:
-                result = tools_map[name].invoke(args)
-                status = "SUCCESS ✓"
+                result = tool_fn.invoke(tc["args"]) if tool_fn else f"Unknown tool: {tc['name']}"
             except Exception as e:
                 result = f"Error: {e}"
-                status = f"FAILED ✗ — {str(e)[:80]}"
-            print(f"      {status}")
-            tool_messages.append(
-                ToolMessage(content=str(result), tool_call_id=call_id, name=name)
-            )
-        else:
-            print(f"      UNKNOWN TOOL")
-            tool_messages.append(
-                ToolMessage(
-                    content=f"Unknown tool: {name}",
-                    tool_call_id=call_id,
-                    name=name,
-                )
+
+            new_messages.append(
+                ToolMessage(content=str(result), tool_call_id=tc["id"], name=tc["name"])
             )
 
-    print(f"[TOOL CALLER] Completed {len(tool_messages)} tool(s).")
+    return new_messages
+
+
+# ============================================================================
+# NODE 2 — TOOL EXECUTOR  (runs one group per call; parallel within the group)
+# ============================================================================
+
+def tool_executor_node(state: AgentState) -> AgentState:
+    plan        = state["plan"]
+    group_idx   = state["current_group_index"]
+    messages    = state["messages"]
+    query       = state["initial_query"]
+
+    groups = _get_groups(plan)
+
+    if group_idx >= len(groups):
+        return {**state, "current_step": "plan_exhausted"}
+
+    current_group    = groups[group_idx]
+    previous_results = _collect_tool_results(messages)
+    is_parallel      = len(current_group) > 1
+
+    print(f"\n[EXECUTOR] Group {group_idx + 1}/{len(groups)} "
+          f"— {len(current_group)} tool(s) "
+          f"({'parallel' if is_parallel else 'sequential'})")
+
+    if is_parallel:
+        # ── Run all steps in this group concurrently ──────────────────────
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        all_new_messages = []
+        futures_map      = {}
+
+        with ThreadPoolExecutor(max_workers=len(current_group)) as executor:
+            for step in current_group:
+                future = executor.submit(
+                    _execute_single_step, step, query, previous_results
+                )
+                futures_map[future] = step["tool"]
+
+            for future in as_completed(futures_map):
+                tool_name = futures_map[future]
+                try:
+                    result_msgs = future.result()
+                    print(f"  [parallel] {tool_name} → done")
+                except Exception as e:
+                    print(f"  [parallel] {tool_name} → FAILED: {e}")
+                    result_msgs = []
+                all_new_messages.extend(result_msgs)
+
+    else:
+        # ── Single step — no threading overhead ───────────────────────────
+        step = current_group[0]
+        print(f"  [sequential] {step['tool']}")
+        all_new_messages = _execute_single_step(step, query, previous_results)
 
     return {
         **state,
-        "messages":     messages + tool_messages,
-        "current_step": "tools_called",
+        "messages":            messages + all_new_messages,
+        "current_group_index": group_idx + 1,
+        "current_step":        "group_executed",
+    }
+
+
+# ============================================================================
+# NODE 3 — RESPONDER
+# ============================================================================
+
+def responder_node(state: AgentState) -> AgentState:
+    query        = state["initial_query"]
+    tool_results = _collect_tool_results(state["messages"])
+
+    chain    = RESPONDER_PROMPT | _make_model()
+    response = chain.invoke({"initial_query": query, "tool_results": tool_results})
+
+    print("\n[RESPONDER] Final response ready.")
+    return {
+        **state,
+        "messages":     state["messages"] + [response],
+        "current_step": "done",
     }
 
 
@@ -723,17 +735,23 @@ def tool_caller_node(state: AgentState) -> AgentState:
 # CONDITIONAL EDGE
 # ============================================================================
 
-def should_continue_or_end(state: AgentState) -> str:
-    """
-    After tools execute, route back to planner for another cycle,
-    OR end if the planner already marked the request as satisfied.
-    """
-    if state.get("is_satisfied"):
-        print("\n[ROUTER] Request satisfied → END")
-        return "end"
+def has_more_groups(state: AgentState) -> str:
+    groups = _get_groups(state["plan"])
+    if state["current_group_index"] < len(groups):
+        return "continue"
+    return "end"
 
-    print("\n[ROUTER] More steps needed → back to PLANNER")
-    return "re_plan"
+
+# ============================================================================
+# STATE  (updated — step_index → group_index)
+# ============================================================================
+
+class AgentState(TypedDict):
+    messages:             Annotated[list, add_messages]
+    initial_query:        str
+    plan:                 list
+    current_group_index:  int    # which GROUP the executor is on (not step)
+    current_step:         str
 
 
 # ============================================================================
@@ -743,28 +761,23 @@ def should_continue_or_end(state: AgentState) -> str:
 def create_flood_agent():
     workflow = StateGraph(AgentState)
 
-    # Nodes
-    workflow.add_node("planner",      planner_node)
+    workflow.add_node("planner",       planner_node)
     workflow.add_node("tool_executor", tool_executor_node)
-    workflow.add_node("tool_caller",  tool_caller_node)
+    workflow.add_node("responder",     responder_node)
 
-    # Entry point
     workflow.set_entry_point("planner")
+    workflow.add_edge("planner", "tool_executor")
 
-    # Fixed edges
-    workflow.add_edge("planner",       "tool_executor")   # planner → executor
-    workflow.add_edge("tool_executor", "tool_caller")     # executor → caller
-
-    # Conditional edge back to planner or END
     workflow.add_conditional_edges(
-        "tool_caller",
-        should_continue_or_end,
+        "tool_executor",
+        has_more_groups,
         {
-            "re_plan": "planner",   # loop: tool_caller → planner
-            "end":     END,
+            "continue": "tool_executor",
+            "end":      "responder",
         }
     )
 
+    workflow.add_edge("responder", END)
     return workflow.compile()
 
 
@@ -773,41 +786,24 @@ def create_flood_agent():
 # ============================================================================
 
 def run_agent(query: str):
-    if not os.getenv("GOOGLE_API_KEY"):
-        print("Error: GOOGLE_API_KEY not set.")
-        return
-
     agent = create_flood_agent()
 
-    initial_state: AgentState = {
-        "messages":     [HumanMessage(content=query)],
-        "initial_query": query,
-        "plan":         [],
-        "current_step": "start",
-        "is_satisfied": False,
-    }
+    result = agent.invoke({
+        "messages":            [HumanMessage(content=query)],
+        "initial_query":       query,
+        "plan":                [],
+        "current_group_index": 0,
+        "current_step":        "start",
+    })
 
-    print("=" * 70)
-    print(f"QUERY: {query}")
-    print("=" * 70)
-
-    result = agent.invoke(initial_state)
-
-    final = result["messages"][-1]
     print("\n" + "=" * 70)
-    print("FINAL RESPONSE:")
-    print("=" * 70)
-    print(final.content)
-
-    total_tool_calls = sum(
-        1 for m in result["messages"]
-        if hasattr(m, "tool_calls") and m.tool_calls
-    )
-    print(f"\nSUMMARY — Tool call rounds: {total_tool_calls} | "
-          f"Total messages: {len(result['messages'])}")
-    print("=" * 70)
-
+    print(result["messages"][-1].content)
+    groups     = _get_groups(result["plan"])
+    total_steps = len(result["plan"])
+    print(f"\n{total_steps} steps in {len(groups)} group(s) | "
+          f"parallel batches: {sum(1 for g in groups if len(g) > 1)}")
     return result
+
 
 
 if __name__ == "__main__":
