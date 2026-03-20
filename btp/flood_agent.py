@@ -1,14 +1,20 @@
 import os
-from typing import TypedDict, Annotated, Sequence
+from typing import Optional, TypedDict, Annotated, Sequence
 import operator
-from langgraph.graph import StateGraph, END
+from langchain_core import messages
+from langgraph.graph import StateGraph, END, add_messages
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_core.prompts import PromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.tools import tool
 import requests
 import time
 from flood_data_simulator import flood_simulator
 from dotenv import load_dotenv
+import json
+import re
+import ssl
+import certifi
 
 load_dotenv()
 
@@ -444,265 +450,363 @@ def check_vehicle_passability(lat: float, lon: float, vehicle_type: str = "car")
     except Exception as e:
         return f"Error checking vehicle passability: {str(e)}"
 
-
 # ============================================================================
-# STATE DEFINITION
+# STATE
 # ============================================================================
 
 class AgentState(TypedDict):
-    """State of the agent."""
-    messages: Annotated[Sequence[BaseMessage], operator.add]
+    messages: Annotated[list, add_messages]
+    initial_query: str
+    plan: Optional[list]          # structured plan from planner
     current_step: str
+    is_satisfied: bool
 
 
 # ============================================================================
-# AGENT NODES
+# PROMPTS
 # ============================================================================
 
-def call_model(state: AgentState):
-    """Node that calls the LLM with available tools."""
-    messages = state["messages"]
-    
-    # Add system instruction to guide the model
-    system_message = HumanMessage(content="""You are a flood disaster management assistant for Jodhpur, Rajasthan.
+PLANNER_PROMPT = PromptTemplate(
+    input_variables=["initial_query", "messages"],
+    template="""
+You are a PLANNING AGENT for a Flood Disaster Assistance System.
 
- CRITICAL MULTI-STEP WORKFLOW RULES - YOU MUST FOLLOW THESE:
+Analyze the conversation history:
+{messages}
 
-1. NEVER provide a final answer after calling just ONE tool!
-2. For emergency/medical queries, you MUST call AT LEAST 3-4 tools before answering
+User's original request:
+{initial_query}
 
-MANDATORY WORKFLOW FOR "need medical help" OR "find nearest hospital" queries:
-   Step 1: Call get_coordinates_from_location (user's location)
-   Step 2: Call search_amenity (find hospitals)  
-   Step 3: Call check_amenity_flood_status (check which are safe)
-   Step 4: Call check_route_flood_safety (verify routes to safe ones)
-   Step 5: ONLY THEN provide final answer
+---
+STEP 1 — Check if the request is already fully satisfied by previous tool results.
 
-RULES:
-- When users mention location names, ALWAYS use get_coordinates_from_location FIRST
-- After getting coordinates, IMMEDIATELY call the next tool - DO NOT STOP
-- Complete ALL necessary steps (typically 3-5 tools) before final response
-- Never ask users for coordinates - look them up automatically
+If YES, return EXACTLY:
+{{
+  "status": "satisfied",
+  "reason": "<why the request is already answered>"
+}}
 
-Available tools:
-- get_coordinates_from_location: Convert place names to coordinates
-- search_amenity: Find facilities (hospitals, police, etc.)
-- check_amenity_flood_status: Check flood safety of facilities
-- check_route_flood_safety: Verify route safety between locations
-- check_vehicle_passability: Check if specific vehicles can pass
-- check_flood_depth: Get flood depth at coordinates
-- get_flooded_areas: List all flooded zones
+If NO, create a step-by-step execution plan using ONLY these tools:
+  1. get_coordinates_from_location  — convert place names to coordinates
+  2. search_amenity                 — find hospitals, shelters, police stations, etc.
+  3. check_amenity_flood_status     — check if a facility is flooded or safe
+  4. check_route_flood_safety       — check if a route between two points is safe
+  5. check_vehicle_passability      — check if a vehicle can pass through flood water
+  6. check_flood_depth              — get flood depth at specific coordinates
+  7. get_flooded_areas              — list all currently flooded zones
 
-Remember: Getting coordinates is just step 1. You must continue with more tools!""")
-    
-    # Prepend system message if not already present
-    if not messages or messages[0].content != system_message.content:
-        messages = [system_message] + list(messages)
-    
-        # Initialize Gemini model with tools
+PLANNING RULES:
+- Always resolve place names to coordinates before any geographic analysis.
+- Always verify flood safety of facilities before recommending them.
+- Always verify route safety before suggesting a route.
+- Check vehicle passability if any vehicle is mentioned.
+- Avoid redundant tool calls.
+- Each step must logically build on the previous one.
+
+Return EXACTLY:
+{{
+  "status": "planning_required",
+  "plan": [
+    {{
+      "step": 1,
+      "tool": "<tool_name>",
+      "purpose": "<why>",
+      "input": "<what to pass>",
+      "expected_output": "<what the tool will return>"
+    }}
+  ]
+}}
+"""
+)
+
+EXECUTOR_PROMPT = PromptTemplate(
+    input_variables=["initial_query", "messages", "plan"],
+    template="""
+You are a FLOOD DISASTER EXECUTION AGENT for Jodhpur, Rajasthan.
+
+Original user request:
+{initial_query}
+
+Current conversation/tool results so far:
+{messages}
+
+Planner's step-by-step plan to follow:
+{plan}
+
+---
+EXECUTION RULES:
+
+1. Follow the plan in order. Execute only the NEXT uncompleted step.
+2. Do NOT skip steps or jump ahead.
+3. After each tool call, the results will be fed back for the next iteration.
+4. Do NOT answer the user directly — only make the required tool calls.
+
+AVAILABLE TOOLS:
+- get_coordinates_from_location
+- search_amenity
+- check_amenity_flood_status
+- check_route_flood_safety
+- check_vehicle_passability
+- check_flood_depth
+- get_flooded_areas
+
+Now execute the next required tool call from the plan.
+"""
+)
+
+
+# ============================================================================
+# NODES
+# ============================================================================
+
+def planner_node(state: AgentState) -> AgentState:
+    """
+    Checks if the user's request is satisfied.
+    If not, creates a structured plan and stores it in state.
+    """
+    messages   = state["messages"]
+    query      = state["initial_query"]
+
     model = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",  # Latest experimental model with better reasoning
+        model="gemini-2.5-flash",
         temperature=0,
-        google_api_key=''
+        google_api_key=os.getenv("GOOGLE_API_KEY")
     )
-    
-    # Bind tools to model
-    tools = [
-        search_amenity, 
+
+    chain    = PLANNER_PROMPT | model
+    response = chain.invoke({"initial_query": query, "messages": messages})
+
+    # Parse JSON from the model response
+    try:
+        raw  = response.content.strip()
+        # strip markdown fences if present
+        raw  = re.sub(r"```(?:json)?", "", raw).strip().rstrip("```").strip()
+        data = json.loads(raw)
+    except (json.JSONDecodeError, AttributeError):
+        data = {"status": "planning_required", "plan": []}
+
+    is_satisfied = data.get("status") == "satisfied"
+    plan         = data.get("plan", [])
+#helper function to print the plan in a readable format
+    print(f"\n[PLANNER] Status: {'SATISFIED ✓' if is_satisfied else 'PLANNING REQUIRED'}")
+    if not is_satisfied:
+        for step in plan:
+            print(f"  Step {step['step']}: {step['tool']} — {step['purpose']}")
+
+    return {
+        **state,
+        "messages":     messages + [response],
+        "plan":         plan,
+        "is_satisfied": is_satisfied,
+        "current_step": "planner_done",
+    }
+
+
+def tool_executor_node(state: AgentState) -> AgentState:
+    """
+    Validates the plan and invokes the LLM with tools bound,
+    so the LLM can select and call the correct tool for the current step.
+    """
+    messages = state["messages"]
+    query    = state["initial_query"]
+    plan     = state.get("plan", [])
+
+    model = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        temperature=0,
+        google_api_key=os.getenv("GOOGLE_API_KEY")
+    )
+
+    tools_list = [
+        search_amenity,
         get_city_bbox,
-        get_coordinates_from_location,  # NEW: Convert place names to coordinates
+        get_coordinates_from_location,
         calculate_route,
         check_flood_depth,
         get_flooded_areas,
         check_amenity_flood_status,
         check_route_flood_safety,
-        check_vehicle_passability
+        check_vehicle_passability,
     ]
-    model_with_tools = model.bind_tools(tools)
-    
-    # Call model
-    print("\n[AGENT] Analyzing query and selecting appropriate tools...")
-    response = model_with_tools.invoke(messages)
-    
-    # Show which tools were selected
-    if hasattr(response, "tool_calls") and response.tool_calls:
-        print(f"[AGENT] Selected {len(response.tool_calls)} tool(s) for execution:")
-        for idx, tool_call in enumerate(response.tool_calls, 1):
-            tool_name = tool_call["name"]
-            tool_args = tool_call.get("args", {})
-            print(f"        {idx}. {tool_name}({', '.join(f'{k}={v}' for k, v in list(tool_args.items())[:2])}...)")
-    
-    return {"messages": [response], "current_step": "model_called"}
+    model_with_tools = model.bind_tools(tools_list)
 
-
-def execute_tools(state: AgentState):
-    """Node that executes tool calls from the model."""
-    messages = state["messages"]
-    last_message = messages[-1]
-    
-    # Check if there are tool calls
-    if not hasattr(last_message, "tool_calls") or not last_message.tool_calls:
-        return {"messages": [], "current_step": "no_tools"}
-    
-    print("\n[TOOLS] Executing selected tools...")
-    
-    # Map tool names to actual functions
-    tools_map = {
-        "search_amenity": search_amenity,
-        "get_city_bbox": get_city_bbox,
-        "get_coordinates_from_location": get_coordinates_from_location,  # NEW
-        "calculate_route": calculate_route,
-        "check_flood_depth": check_flood_depth,
-        "get_flooded_areas": get_flooded_areas,
-        "check_amenity_flood_status": check_amenity_flood_status,
-        "check_route_flood_safety": check_route_flood_safety,
-        "check_vehicle_passability": check_vehicle_passability
-    }
-    
-    # Execute each tool call
-    tool_messages = []
-    for idx, tool_call in enumerate(last_message.tool_calls, 1):
-        tool_name = tool_call["name"]
-        tool_args = tool_call["args"]
-        tool_id = tool_call["id"]
-        
-        # Print tool execution
-        print(f"\n        [{idx}] Executing: {tool_name}")
-        if tool_args:
-            for key, value in tool_args.items():
-                # Truncate long values for readability
-                display_value = str(value)[:50] + "..." if len(str(value)) > 50 else value
-                print(f"            - {key}: {display_value}")
-        
-        if tool_name in tools_map:
-            tool_func = tools_map[tool_name]
-            try:
-                print(f"            Status: Processing...")
-                result = tool_func.invoke(tool_args)
-                print(f"            Status: SUCCESS")
-                tool_messages.append(
-                    ToolMessage(
-                        content=str(result),
-                        tool_call_id=tool_id,
-                        name=tool_name
-                    )
-                )
-            except Exception as e:
-                print(f"            Status: FAILED - {str(e)[:100]}")
-                tool_messages.append(
-                    ToolMessage(
-                        content=f"Error executing {tool_name}: {str(e)}",
-                        tool_call_id=tool_id,
-                        name=tool_name
-                    )
-                )
-    
-    print(f"\n[TOOLS] Completed execution of {len(tool_messages)} tool(s)")
-    
-    return {"messages": tool_messages, "current_step": "tools_executed"}
-
-
-def should_continue(state: AgentState):
-    """Determine if we should continue to tools or end."""
-    messages = state["messages"]
-    last_message = messages[-1]
-    
-    # If there are tool calls, continue to tools
-    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        print("\n[AGENT] Additional information required, continuing iteration...")
-        return "continue"
-    
-    # Otherwise, end
-    print("\n[AGENT] Sufficient information gathered, generating final response...")
-    return "end"
-
-
-# 
-# GRAPH CONSTRUCTION
-# 
-
-def create_flood_agent():
-    """Create and compile the flood help agent graph."""
-    
-    # Create the graph
-    workflow = StateGraph(AgentState)
-    
-    # Add nodes
-    workflow.add_node("agent", call_model)
-    workflow.add_node("tools", execute_tools)
-    
-    # Set entry point
-    workflow.set_entry_point("agent")
-    
-    # Add conditional edges
-    workflow.add_conditional_edges(
-        "agent",
-        should_continue,
-        {
-            "continue": "tools",
-            "end": END
-        }
+    # Build the executor prompt
+    prompt_text = EXECUTOR_PROMPT.format(
+        initial_query=query,
+        messages=messages,
+        plan=json.dumps(plan, indent=2),
     )
-    
-    # Add edge from tools back to agent
-    workflow.add_edge("tools", "agent")
-    
-    # Compile the graph
-    app = workflow.compile()
-    
-    return app
+
+    print("\n[EXECUTOR] Selecting next tool from plan...")
+    response = model_with_tools.invoke([HumanMessage(content=prompt_text)])
+
+    if hasattr(response, "tool_calls") and response.tool_calls:
+        print(f"[EXECUTOR] Calling {len(response.tool_calls)} tool(s):")
+        for tc in response.tool_calls:
+            args_preview = ", ".join(
+                f"{k}={str(v)[:40]}" for k, v in list(tc.get("args", {}).items())[:2]
+            )
+            print(f"  → {tc['name']}({args_preview})")
+    else:
+        print("[EXECUTOR] No tool calls generated.")
+
+    return {
+        **state,
+        "messages":     messages + [response],
+        "current_step": "executor_done",
+    }
+
+
+def tool_caller_node(state: AgentState) -> AgentState:
+    """
+    Executes every pending tool call in the last message
+    and appends ToolMessage results back into state.
+    """
+    messages     = state["messages"]
+    last_message = messages[-1]
+
+    if not (hasattr(last_message, "tool_calls") and last_message.tool_calls):
+        return {**state, "current_step": "no_tools"}
+
+    tools_map = {
+        "search_amenity":              search_amenity,
+        "get_city_bbox":               get_city_bbox,
+        "get_coordinates_from_location": get_coordinates_from_location,
+        "calculate_route":             calculate_route,
+        "check_flood_depth":           check_flood_depth,
+        "get_flooded_areas":           get_flooded_areas,
+        "check_amenity_flood_status":  check_amenity_flood_status,
+        "check_route_flood_safety":    check_route_flood_safety,
+        "check_vehicle_passability":   check_vehicle_passability,
+    }
+
+    print("\n[TOOL CALLER] Executing tools...")
+    tool_messages = []
+
+    for idx, tc in enumerate(last_message.tool_calls, 1):
+        name    = tc["name"]
+        args    = tc["args"]
+        call_id = tc["id"]
+
+        print(f"  [{idx}] {name}")
+        if name in tools_map:
+            try:
+                result = tools_map[name].invoke(args)
+                status = "SUCCESS ✓"
+            except Exception as e:
+                result = f"Error: {e}"
+                status = f"FAILED ✗ — {str(e)[:80]}"
+            print(f"      {status}")
+            tool_messages.append(
+                ToolMessage(content=str(result), tool_call_id=call_id, name=name)
+            )
+        else:
+            print(f"      UNKNOWN TOOL")
+            tool_messages.append(
+                ToolMessage(
+                    content=f"Unknown tool: {name}",
+                    tool_call_id=call_id,
+                    name=name,
+                )
+            )
+
+    print(f"[TOOL CALLER] Completed {len(tool_messages)} tool(s).")
+
+    return {
+        **state,
+        "messages":     messages + tool_messages,
+        "current_step": "tools_called",
+    }
 
 
 # ============================================================================
-# MAIN EXECUTION
+# CONDITIONAL EDGE
+# ============================================================================
+
+def should_continue_or_end(state: AgentState) -> str:
+    """
+    After tools execute, route back to planner for another cycle,
+    OR end if the planner already marked the request as satisfied.
+    """
+    if state.get("is_satisfied"):
+        print("\n[ROUTER] Request satisfied → END")
+        return "end"
+
+    print("\n[ROUTER] More steps needed → back to PLANNER")
+    return "re_plan"
+
+
+# ============================================================================
+# GRAPH
+# ============================================================================
+
+def create_flood_agent():
+    workflow = StateGraph(AgentState)
+
+    # Nodes
+    workflow.add_node("planner",      planner_node)
+    workflow.add_node("tool_executor", tool_executor_node)
+    workflow.add_node("tool_caller",  tool_caller_node)
+
+    # Entry point
+    workflow.set_entry_point("planner")
+
+    # Fixed edges
+    workflow.add_edge("planner",       "tool_executor")   # planner → executor
+    workflow.add_edge("tool_executor", "tool_caller")     # executor → caller
+
+    # Conditional edge back to planner or END
+    workflow.add_conditional_edges(
+        "tool_caller",
+        should_continue_or_end,
+        {
+            "re_plan": "planner",   # loop: tool_caller → planner
+            "end":     END,
+        }
+    )
+
+    return workflow.compile()
+
+
+# ============================================================================
+# RUNNER
 # ============================================================================
 
 def run_agent(query: str):
-    """Run the flood agent with a user query."""
-    
-    # Check for API key
     if not os.getenv("GOOGLE_API_KEY"):
-        print("Error: GOOGLE_API_KEY environment variable not set!")
-        print("Please set it using: export GOOGLE_API_KEY='your-api-key'")
+        print("Error: GOOGLE_API_KEY not set.")
         return
-    
 
     agent = create_flood_agent()
-    
-    # Initialize state
-    initial_state = {
-        "messages": [HumanMessage(content=query)],
-        "current_step": "start"
+
+    initial_state: AgentState = {
+        "messages":     [HumanMessage(content=query)],
+        "initial_query": query,
+        "plan":         [],
+        "current_step": "start",
+        "is_satisfied": False,
     }
-    
-    print("="*70)
-    print("USER QUERY:")
-    print("="*70)
-    print(f"{query}\n")
-    
-    print("="*70)
-    print("AGENT EXECUTION TRACE:")
-    print("="*70)
-    
-    # Run agent
+
+    print("=" * 70)
+    print(f"QUERY: {query}")
+    print("=" * 70)
+
     result = agent.invoke(initial_state)
-    
-    # Print final response
-    final_message = result["messages"][-1]
-    print("\n" + "="*70)
+
+    final = result["messages"][-1]
+    print("\n" + "=" * 70)
     print("FINAL RESPONSE:")
-    print("="*70)
-    print(final_message.content)
-    print("="*70 + "\n")
-    
-    # Show execution summary
-    tool_calls_count = sum(1 for msg in result["messages"] if hasattr(msg, "tool_calls") and msg.tool_calls)
-    print("EXECUTION SUMMARY:")
-    print(f"  - Agent Iterations: {tool_calls_count}")
-    print(f"  - Total Messages Exchanged: {len(result['messages'])}")
-    print(f"  - Execution Status: COMPLETED")
-    print("="*70 + "\n")
-    
+    print("=" * 70)
+    print(final.content)
+
+    total_tool_calls = sum(
+        1 for m in result["messages"]
+        if hasattr(m, "tool_calls") and m.tool_calls
+    )
+    print(f"\nSUMMARY — Tool call rounds: {total_tool_calls} | "
+          f"Total messages: {len(result['messages'])}")
+    print("=" * 70)
+
     return result
 
 
@@ -737,7 +841,7 @@ if __name__ == "__main__":
     
     
     # Select query to run (change index: 0-7)
-    selected_query_index = 1  # Default: Query 1 
+    selected_query_index = 4 # Default: Query 1 
 
     print(f"\nExecuting Query {selected_query_index + 1}:")
     print(f"'{btp_demo_queries[selected_query_index]}'\n")
