@@ -25,7 +25,7 @@ load_dotenv()
 @tool
 def search_amenity(amenity: str, city: str, state: str = "Rajasthan", country: str = "India", limit: int = 10) -> str:
     """
-    Search for a    # Select query to run (change index: 0-6 for queries 1-7)
+     # Select query to run (change index: 0-6 for queries 1-7)
     selected_query_index = 0  # Default: Query 1 (simple - uses fewer API calls)
     
     print(f"\nExecuting Query {selected_query_index + 1}:")
@@ -219,17 +219,21 @@ def calculate_route(start_lat: float, start_lon: float, end_lat: float, end_lon:
     """
     token = ""  # Bhuvan API token
     
-    url = (
-        "https://bhuvan-app1.nrsc.gov.in/api/routing/curl_routing_state.php"
-        f"?lat1={start_lat}&lon1={start_lon}&lat2={end_lat}&lon2={end_lon}&token={token}"
-    )
-    
+    url = "https://api.openrouteservice.org/v2/directions/driving-car"
     headers = {
-        "Content-Type": "application/x-www-form-urlencoded"
+    "Authorization": "YOUR_API_KEY",
+    "Content-Type": "application/json"
     }
+
+    body = {   
+        "coordinates": [
+        [77.1025, 28.7041],  # Delhi
+        [77.2090, 28.6139]   # Another point
+    ]
+}
     
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        response = requests.post(url, headers=headers, json=body, timeout=15)
         response.raise_for_status()
         route_data = response.json()
         
@@ -549,10 +553,34 @@ Do NOT call any other tool. Do NOT write a final answer — only the tool call.
 """
 )
 
+RESPONDER_PROMPT = PromptTemplate(
+    input_variables=["initial_query", "tool_results"],
+    template="""
+You are a flood disaster response assistant for Jodhpur, Rajasthan.
 
+The user asked: {initial_query}
+
+All tool results collected:
+{tool_results}
+
+Using only the information above, write a clear, helpful, safety-focused final response to the user.
+Highlight any flooded areas or unsafe routes. Recommend only verified-safe facilities.
+"""
+)
 # ============================================================================
 # HELPERS
 # ============================================================================
+TOOLS_MAP = {
+    "search_amenity": search_amenity,
+    "get_city_bbox": get_city_bbox,
+    "get_coordinates_from_location": get_coordinates_from_location,
+    "calculate_route": calculate_route,
+    "check_flood_depth": check_flood_depth,
+    "get_flooded_areas": get_flooded_areas,
+    "check_amenity_flood_status": check_amenity_flood_status,
+    "check_route_flood_safety": check_route_flood_safety,
+    "check_vehicle_passability": check_vehicle_passability,
+}
 
 def _collect_tool_results(messages: list) -> str:
     parts = []
@@ -778,7 +806,11 @@ def create_flood_agent():
     )
 
     workflow.add_edge("responder", END)
-    return workflow.compile()
+    g=workflow.compile()
+    png_bytes = g.draw_mermaid_png()
+    with open("workflow.png", "wb") as f:
+        f.write(png_bytes)
+    return g
 
 
 # ============================================================================
