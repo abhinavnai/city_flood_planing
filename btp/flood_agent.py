@@ -23,6 +23,122 @@ load_dotenv()
 # TOOLS DEFINITION
 # ============================================================================
 
+import math
+import heapq
+
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371
+    return R * math.acos(
+        math.cos(math.radians(lat1)) *
+        math.cos(math.radians(lat2)) *
+        math.cos(math.radians(lon2 - lon1)) +
+        math.sin(math.radians(lat1)) *
+        math.sin(math.radians(lat2))
+    )
+
+
+def get_neighbors(lat, lon, step=0.01):
+    return [
+        (lat + step, lon),
+        (lat - step, lon),
+        (lat, lon + step),
+        (lat, lon - step),
+    ]
+
+
+def flood_penalty(lat, lon):
+    depth = flood_simulator.get_flood_depth(lat, lon)
+
+    if depth > 2:
+        return 1000
+    elif depth > 1:
+        return 100
+    elif depth > 0.3:
+        return 10
+    return 0
+
+
+def dijkstra_flood(start, end):
+    pq = [(0, start)]
+    visited = set()
+    parent = {}
+    cost_map = {start: 0}
+
+    while pq:
+        cost, current = heapq.heappop(pq)
+
+        if current in visited:
+            continue
+        visited.add(current)
+
+        if current == end:
+            break
+
+        for n in get_neighbors(*current):
+            if n in visited:
+                continue
+
+            new_cost = cost + haversine(*current, *n) + flood_penalty(*n)
+
+            if n not in cost_map or new_cost < cost_map[n]:
+                cost_map[n] = new_cost
+                parent[n] = current
+                heapq.heappush(pq, (new_cost, n))
+
+    path = []
+    node = end
+    while node in parent:
+        path.append(node)
+        node = parent[node]
+    path.append(start)
+    path.reverse()
+
+    return path
+
+@tool
+def optimize_flood_safe_route(start_lat: float, start_lon: float, locations: list) -> str:
+    """
+    Find safest route across multiple locations avoiding flooded areas.
+    locations = [{"name": "...", "lat": ..., "lon": ...}]
+    """
+
+    try:
+        current = (start_lat, start_lon)
+        route_order = []
+        unvisited = locations.copy()
+
+        # STEP 1: decide order (nearest neighbor)
+        while unvisited:
+            nearest = min(
+                unvisited,
+                key=lambda loc: haversine(current[0], current[1], loc["lat"], loc["lon"])
+            )
+            route_order.append(nearest)
+            current = (nearest["lat"], nearest["lon"])
+            unvisited.remove(nearest)
+
+        # STEP 2: build flood-safe path
+        full_path = []
+        current = (start_lat, start_lon)
+
+        for loc in route_order:
+            target = (loc["lat"], loc["lon"])
+            segment = dijkstra_flood(current, target)
+            full_path.extend(segment)
+            current = target
+
+        result = "Flood-Safe Route:\n\n"
+
+        for i, loc in enumerate(route_order, 1):
+            result += f"{i}. {loc['name']} ({loc['lat']}, {loc['lon']})\n"
+
+        result += "\nRoute avoids flooded areas as much as possible."
+
+        return result
+
+    except Exception as e:
+        return f"Error: {str(e)}"
+
 @tool
 def search_amenity(amenity: str, city: str, state: str = "Rajasthan", country: str = "India", limit: int = 10) -> str:
     """
@@ -448,6 +564,22 @@ def check_vehicle_passability(lat: float, lon: float, vehicle_type: str = "car")
     
     except Exception as e:
         return f"Error checking vehicle passability: {str(e)}"
+
+TOOLS_MAP = {
+    "search_amenity": search_amenity,
+    "get_city_bbox": get_city_bbox,
+    "get_coordinates_from_location": get_coordinates_from_location,
+    "calculate_route": calculate_route,
+    "check_flood_depth": check_flood_depth,
+    "get_flooded_areas": get_flooded_areas,
+    "check_amenity_flood_status": check_amenity_flood_status,
+    "check_route_flood_safety": check_route_flood_safety,
+    "check_vehicle_passability": check_vehicle_passability,
+
+    # 👇 ADD YOUR NEW TOOL HERE
+    "optimize_flood_safe_route": optimize_flood_safe_route,
+}
+
 class AgentState(TypedDict):
     messages:       Annotated[list, add_messages]
     initial_query:  str
@@ -478,6 +610,7 @@ AVAILABLE TOOLS:
   5. check_vehicle_passability      — check if a vehicle type can pass flood water
   6. check_flood_depth              — get flood depth at coordinates
   7. get_flooded_areas              — list all currently flooded zones
+  8. optimize_flood_safe_route      — find safest route across multiple locations
 
 GROUPING RULES:
 - Same group number = runs in PARALLEL (no dependency on each other).
