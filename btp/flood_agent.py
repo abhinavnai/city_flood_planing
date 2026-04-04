@@ -15,6 +15,7 @@ import json
 import re
 import ssl
 import certifi
+from shortest_path import get_shortest_path, visualize_routes
 
 load_dotenv()
 
@@ -89,7 +90,7 @@ def search_amenity(amenity: str, city: str, state: str = "Rajasthan", country: s
 
 
 @tool
-def get_city_bbox(city: str, state: str = "Rajasthan", country: str = "India") -> str:
+def get_city_bbox(city: str="Gujrat", state: str = "Punjab", country: str = "pakistan") -> str:
     """
     Get the bounding box coordinates for a city. Useful for flood mapping and area analysis.
     
@@ -137,7 +138,7 @@ def get_city_bbox(city: str, state: str = "Rajasthan", country: str = "India") -
 
 
 @tool
-def get_coordinates_from_location(location_name: str, city: str = "Jodhpur", state: str = "Rajasthan", country: str = "India") -> str:
+def get_coordinates_from_location(location_name: str, city: str="Gujrat", state: str = "Punjab", country: str = "India") -> str:
     """
     Convert a location name (like "AIIMS", "Railway Station", "City Hospital") to GPS coordinates.
     ALWAYS use this tool when user provides a place name instead of coordinates.
@@ -206,7 +207,7 @@ def get_coordinates_from_location(location_name: str, city: str = "Jodhpur", sta
 @tool
 def calculate_route(start_lat: float, start_lon: float, end_lat: float, end_lon: float) -> str:
     """
-    Calculate the shortest route between two points using Bhuvan Routing API.
+    Calculate the shortest route between two points.
     
     Args:
         start_lat: Starting point latitude
@@ -215,38 +216,32 @@ def calculate_route(start_lat: float, start_lon: float, end_lat: float, end_lon:
         end_lon: Destination point longitude
     
     Returns:
-        Route information as a formatted string
+        Route information as a list
     """
-    token = ""  # Bhuvan API token
-    
-    url = "https://api.openrouteservice.org/v2/directions/driving-car"
-    headers = {
-    "Authorization": "YOUR_API_KEY",
-    "Content-Type": "application/json"
-    }
-
-    body = {   
-        "coordinates": [
-        [77.1025, 28.7041],  # Delhi
-        [77.2090, 28.6139]   # Another point
-    ]
-}
     
     try:
-        response = requests.post(url, headers=headers, json=body, timeout=15)
-        response.raise_for_status()
-        route_data = response.json()
-        
-        # Extract relevant information
-        if route_data and isinstance(route_data, dict):
-            return f"Route calculated successfully from ({start_lat}, {start_lon}) to ({end_lat}, {end_lon}). Route data: {route_data}"
-        else:
-            return f"Route data received but in unexpected format: {route_data}"
+        routes,G,G_simple=get_shortest_path(start_lat,start_lon,end_lat,end_lon)
+        return routes,G,G_simple
     
     except Exception as e:
         return f"Error calculating route: {str(e)}"
 
-
+@tool 
+def visulize_route(route: list) -> str:
+    """
+    Visualize the calculated route on a map.
+    
+    Args:
+        route: List of coordinates representing the route
+    
+    Returns:
+        A URL or file path to the visualized route map
+    """
+    try:
+        return visualize_routes(route)
+    
+    except Exception as e:
+        return f"Error visualizing route: {str(e)}"
 @tool
 def check_flood_depth(lat: float, lon: float) -> str:
     """
