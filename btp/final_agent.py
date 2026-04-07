@@ -6,11 +6,11 @@ import math
 import heapq
 import requests
 import geopandas as gpd
-
-from typing import Optional, TypedDict, Annotated
+from typing import List, Dict, Any
+from typing import Any, Optional, TypedDict, Annotated
 from itertools import groupby
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from langchain_groq import ChatGroq
 from shapely.geometry import Point, LineString
 from shapely.ops import unary_union
 
@@ -489,7 +489,7 @@ def calculate_route(
     place:          str = OSM_PLACE,
     shapefile_path: str = SHAPEFILE_PATH,
     vehicle_type:   str = "car",
-    k:              int = 3
+    k:              int = 1
 ) -> str:
     """
     Compute up to K flood-aware shortest routes on the real road network using the
@@ -591,7 +591,7 @@ def visualize_route(output_file: str = "graph.html") -> str:
 def optimize_flood_safe_route(
     start_lat: float,
     start_lon: float,
-    locations: list
+    locations: List[Dict[str, Any]]
 ) -> str:
     """
     Find the safest visiting order and flood-avoiding path across multiple locations
@@ -806,20 +806,23 @@ Using only the information above, write a clear, helpful, safety-focused final r
 # HELPERS
 # ============================================================================
 
-def _collect_tool_results(messages: list) -> str:
-    parts = [
-        f"[{m.name}]: {m.content}"
-        for m in messages
-        if isinstance(m, ToolMessage)
-    ]
+def _collect_tool_results(messages: list, max_chars: int = 3000) -> str:
+    """Collect tool results, truncating each to avoid context overflow."""
+    parts = []
+    for m in messages:
+        if isinstance(m, ToolMessage):
+            content = m.content
+            if len(content) > max_chars:
+                content = content[:max_chars] + f"\n... [truncated, {len(m.content)} chars total]"
+            parts.append(f"[{m.name}]: {content}")
     return "\n".join(parts) if parts else "No results yet."
 
 
 def _make_model(with_tools: bool = False):
-    model = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
+    model = ChatGroq(
+        model="llama-3.3-70b-versatile",  # or "mixtral-8x7b-32768"
         temperature=0,
-        google_api_key=os.getenv("GOOGLE_API_KEY"),
+        api_key=os.getenv("GROQ_API_KEY"),
     )
     return model.bind_tools(list(TOOLS_MAP.values())) if with_tools else model
 
@@ -870,6 +873,11 @@ def planner_node(state: AgentState) -> AgentState:
 # ============================================================================
 
 def _execute_single_step(step: dict, initial_query: str, previous_results: str) -> list:
+    # Truncate previous_results hard if still too long
+    if len(previous_results) > 6000:
+        previous_results = previous_results[-6000:]  # keep most recent
+        previous_results = "[earlier results truncated]\n" + previous_results
+
     prompt_text = EXECUTOR_PROMPT.format(
         initial_query=initial_query,
         tool_name=step["tool"],
@@ -877,7 +885,6 @@ def _execute_single_step(step: dict, initial_query: str, previous_results: str) 
         input_description=step["input_description"],
         previous_results=previous_results,
     )
-
     model_with_tools = _make_model(with_tools=True)
     llm_response     = model_with_tools.invoke([HumanMessage(content=prompt_text)])
     new_messages     = [llm_response]
@@ -910,16 +917,13 @@ def tool_executor_node(state: AgentState) -> AgentState:
     if group_idx >= len(groups):
         return {**state, "current_step": "plan_exhausted"}
 
-    current_group    = groups[group_idx]
-    previous_results = _collect_tool_results(messages)
-    is_parallel      = len(current_group) > 1
+    current_group = groups[group_idx]
 
-    print(
-        f"\n[EXECUTOR] Group {group_idx + 1}/{len(groups)} "
-        f"— {len(current_group)} tool(s) "
-        f"({'parallel' if is_parallel else 'sequential'})"
-    )
-
+    # ── Only pass recent tool results, not entire message history ──
+    recent_messages  = messages[-20:]          # last 20 messages only
+    previous_results = _collect_tool_results(recent_messages, max_chars=2000)
+    
+    is_parallel = len(current_group) > 1
     if is_parallel:
         all_new_messages = []
         futures_map      = {}
@@ -1073,7 +1077,7 @@ if __name__ == "__main__":
 
         # 7 — Full road route with map
         (
-            "Calculate the safest driving route from Gujrat Railway Station "
+            "Calculate the safest driving route from (32.5695347, 71.5695347) "
             "to DHQ Hospital and show me the map."
         ),
 
@@ -1085,7 +1089,7 @@ if __name__ == "__main__":
         ),
     ]
 
-    selected = 6   # change index 0-7 to run a different query
+    selected = 6  # change index 0-7 to run a different query
 
     print(f"\nExecuting Query {selected + 1}:")
     print(f"'{demo_queries[selected]}'\n")
