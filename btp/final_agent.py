@@ -11,22 +11,17 @@ from typing import Any, Optional, TypedDict, Annotated
 from itertools import groupby
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_groq import ChatGroq
-from shapely.geometry import Point, LineString
-from shapely.ops import unary_union
+from shapely.geometry import Point
 
-import osmnx as ox
-import networkx as nx
 
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.prompts import PromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, END, add_messages
 
 from dotenv import load_dotenv
 
-# Import shortest_path module
-from shortest_path import get_shortest_path, visualize_routes, vechile_config
+from shortest_path import get_shortest_path, visualize_routes, vechile_config, road_graph_cache
 
 load_dotenv()
 
@@ -60,7 +55,7 @@ def _flood_depth_at_point(lat: float, lon: float) -> float:
     Returns 0.0 if the point is not in any flood polygon.
     """
     gdf   = _get_flood_gdf()
-    point = Point(lon, lat)          # shapely uses (x=lon, y=lat)
+    point = Point(lon, lat)
     hits  = gdf[gdf.geometry.intersects(point)]
 
     if hits.empty:
@@ -72,7 +67,7 @@ def _flood_depth_at_point(lat: float, lon: float) -> float:
     )
     if depth_col:
         return float(hits[depth_col].max())
-    return 1.0   # polygon present but no depth attribute → treat as 1 m
+    return 1.0
 
 
 def _route_points(lat1, lon1, lat2, lon2, steps: int = 20):
@@ -294,7 +289,7 @@ def get_flooded_areas() -> str:
         lines = [f"Flood zones loaded from shapefile ({len(gdf)} polygon(s)):\n"]
         for i, row in gdf.iterrows():
             centroid = row.geometry.centroid
-            area_km2 = row.geometry.area * (111 ** 2)   # rough deg² → km²
+            area_km2 = row.geometry.area * (111 ** 2)
 
             depth_str = ""
             if depth_col and row[depth_col] is not None:
@@ -376,7 +371,6 @@ def check_amenity_flood_status(
         country: Country (default: Pakistan)
     """
     try:
-        # ── 1. Fetch amenities from Nominatim ──────────────────────────────
         url    = "https://nominatim.openstreetmap.org/search"
         params = {
             "q":             f"{amenity} in {city}, {state}, {country}",
@@ -394,7 +388,6 @@ def check_amenity_flood_status(
         if not data:
             return f"No {amenity}s found in {city}."
 
-        # ── 2. Check each amenity against real flood data ──────────────────
         safe_list, flood_list = [], []
         for place in data:
             name  = place.get("display_name", "Unknown").split(",")[0].strip()
@@ -408,7 +401,6 @@ def check_amenity_flood_status(
             else:
                 safe_list.append(entry)
 
-        # ── 3. Format output ───────────────────────────────────────────────
         lines = [
             f"Flood Impact Analysis — {amenity.capitalize()}s in {city}:",
             f"  Total analysed : {len(data)}",
@@ -458,8 +450,8 @@ def check_vehicle_passability(
     limit  = limits.get(vehicle_type.lower(), 0.3)
 
     try:
-        depth     = _flood_depth_at_point(lat, lon)
-        passable  = depth <= limit
+        depth    = _flood_depth_at_point(lat, lon)
+        passable = depth <= limit
 
         rec = (
             "Location is passable."
@@ -486,10 +478,8 @@ def calculate_route(
     start_lon: float,
     end_lat:   float,
     end_lon:   float,
-    place:          str = OSM_PLACE,
-    shapefile_path: str = SHAPEFILE_PATH,
-    vehicle_type:   str = "car",
-    k:              int = 1
+    vehicle_type: str = "car",
+    k:            int = 1
 ) -> str:
     """
     Compute up to K flood-aware shortest routes on the real road network using the
@@ -498,18 +488,16 @@ def calculate_route(
     Args:
         start_lat / start_lon: Origin coordinates
         end_lat   / end_lon  : Destination coordinates
-        place:          OSM place name for road graph download (default: Gujrat, Punjab, Pakistan)
-        shapefile_path: Path to flood depth shapefile (default: project shapefile)
         vehicle_type:   'car' (default)
-        k:              Number of alternative routes (default: 3)
+        k:              Number of alternative routes (default: 1)
     """
     try:
         routes, G, G_simple = get_shortest_path(
             lat1=start_lat, lon1=start_lon,
             lat2=end_lat,   lon2=end_lon,
             token="",
-            place=place,
-            file_name=shapefile_path,
+            place=OSM_PLACE,
+            file_name=SHAPEFILE_PATH,
             k=k,
             vehicle_type=vehicle_type,
             vehicle_config=vechile_config,
@@ -518,11 +506,12 @@ def calculate_route(
         if not routes:
             return "No routes found between the given coordinates."
 
-        # Cache for visualize_route
-        _route_cache["routes"]         = routes
-        _route_cache["G"]              = G
-        _route_cache["G_simple"]       = G_simple
-        _route_cache["shapefile_path"] = shapefile_path
+        # Cache for visualize_route — also store vehicle_type so visualize
+        # can pull the correct edges_gdf from road_graph_cache directly
+        _route_cache["routes"]       = routes
+        _route_cache["G"]            = G
+        _route_cache["G_simple"]     = G_simple
+        _route_cache["vehicle_type"] = vehicle_type
 
         lines = [f"Found {len(routes)} route(s):\n"]
         for i, route in enumerate(routes, 1):
@@ -561,15 +550,18 @@ def visualize_route(output_file: str = "graph.html") -> str:
         if not _route_cache.get("routes"):
             return "No routes cached. Please run calculate_route first."
 
-        routes         = _route_cache["routes"]
-        G              = _route_cache["G"]
-        G_simple       = _route_cache["G_simple"]
-        shapefile_path = _route_cache["shapefile_path"]
+        routes       = _route_cache["routes"]
+        G            = _route_cache["G"]
+        G_simple     = _route_cache["G_simple"]
+        vehicle_type = _route_cache.get("vehicle_type", "car")
 
-        flood_data       = gpd.read_file(shapefile_path)
-        _, edges_gdf     = ox.graph_to_gdfs(G, nodes=True, edges=True)
-        flood_data       = flood_data.to_crs(edges_gdf.crs)
-        vehicle          = vechile_config["car"]
+        # Pull edges_gdf and flood_data straight from the caches —
+        # no graph rebuild, no shapefile re-read
+        _, G_simple_cached, edges_gdf = road_graph_cache.get(
+            OSM_PLACE, SHAPEFILE_PATH, vehicle_type, vechile_config
+        )
+        flood_data = _get_flood_gdf().to_crs(edges_gdf.crs)
+        vehicle    = vechile_config[vehicle_type]
 
         visualize_routes(
             G=G,
@@ -581,7 +573,7 @@ def visualize_route(output_file: str = "graph.html") -> str:
             flood_data=flood_data,
         )
 
-        return f"Map saved to graph.html. Open it in any browser to view the interactive route map."
+        return "Map saved to graph.html. Open it in any browser to view the interactive route map."
 
     except Exception as e:
         return f"Error visualising route: {e}"
@@ -601,6 +593,8 @@ def optimize_flood_safe_route(
         start_lat / start_lon: Starting position
         locations: List of dicts — [{"name": "...", "lat": ..., "lon": ...}]
     """
+    import math
+
     def haversine(lat1, lon1, lat2, lon2):
         R = 6371
         return R * math.acos(
@@ -615,40 +609,6 @@ def optimize_flood_safe_route(
         if depth > 1:   return 100
         if depth > 0.3: return 10
         return 0
-
-    def get_neighbors(lat, lon, step=0.01):
-        return [(lat + step, lon), (lat - step, lon),
-                (lat, lon + step), (lat, lon - step)]
-
-    def dijkstra_flood(start, end):
-        pq       = [(0, start)]
-        visited  = set()
-        parent   = {}
-        cost_map = {start: 0}
-
-        while pq:
-            cost, current = heapq.heappop(pq)
-            if current in visited:
-                continue
-            visited.add(current)
-            if current == end:
-                break
-            for n in get_neighbors(*current):
-                if n in visited:
-                    continue
-                new_cost = cost + haversine(*current, *n) + flood_penalty(*n)
-                if n not in cost_map or new_cost < cost_map[n]:
-                    cost_map[n] = new_cost
-                    parent[n]   = current
-                    heapq.heappush(pq, (new_cost, n))
-
-        path, node = [], end
-        while node in parent:
-            path.append(node)
-            node = parent[node]
-        path.append(start)
-        path.reverse()
-        return path
 
     try:
         current     = (start_lat, start_lon)
@@ -820,9 +780,9 @@ def _collect_tool_results(messages: list, max_chars: int = 3000) -> str:
 
 def _make_model(with_tools: bool = False):
     model = ChatGroq(
-        model="llama-3.3-70b-versatile",  # or "mixtral-8x7b-32768"
+        model="llama-3.3-70b-versatile",
         temperature=0,
-        api_key=os.getenv("GROQ_API_KEY"),
+        api_key="",
     )
     return model.bind_tools(list(TOOLS_MAP.values())) if with_tools else model
 
@@ -873,10 +833,8 @@ def planner_node(state: AgentState) -> AgentState:
 # ============================================================================
 
 def _execute_single_step(step: dict, initial_query: str, previous_results: str) -> list:
-    # Truncate previous_results hard if still too long
     if len(previous_results) > 6000:
-        previous_results = previous_results[-6000:]  # keep most recent
-        previous_results = "[earlier results truncated]\n" + previous_results
+        previous_results = "[earlier results truncated]\n" + previous_results[-6000:]
 
     prompt_text = EXECUTOR_PROMPT.format(
         initial_query=initial_query,
@@ -908,21 +866,20 @@ def _execute_single_step(step: dict, initial_query: str, previous_results: str) 
 # ============================================================================
 
 def tool_executor_node(state: AgentState) -> AgentState:
-    plan       = state["plan"]
-    group_idx  = state["current_group_index"]
-    messages   = state["messages"]
-    query      = state["initial_query"]
-    groups     = _get_groups(plan)
+    plan      = state["plan"]
+    group_idx = state["current_group_index"]
+    messages  = state["messages"]
+    query     = state["initial_query"]
+    groups    = _get_groups(plan)
 
     if group_idx >= len(groups):
         return {**state, "current_step": "plan_exhausted"}
 
     current_group = groups[group_idx]
 
-    # ── Only pass recent tool results, not entire message history ──
-    recent_messages  = messages[-20:]          # last 20 messages only
+    recent_messages  = messages[-20:]
     previous_results = _collect_tool_results(recent_messages, max_chars=2000)
-    
+
     is_parallel = len(current_group) > 1
     if is_parallel:
         all_new_messages = []
@@ -1004,13 +961,9 @@ def create_flood_agent():
 
     g = workflow.compile()
 
-    try:
-        png_bytes = g.draw_mermaid_png()
-        with open("workflow.png", "wb") as f:
-            f.write(png_bytes)
-        print("[INFO] Workflow diagram saved to workflow.png")
-    except Exception:
-        pass   # non-critical
+    png_bytes = g.get_graph().draw_mermaid_png()
+    with open("graph.png", "wb") as f:
+        f.write(png_bytes)
 
     return g
 
@@ -1047,41 +1000,27 @@ def run_agent(query: str):
 
 if __name__ == "__main__":
     demo_queries = [
-        # 1 — Basic flood check at a named location
         "Is DHQ Hospital Gujrat flooded?",
-
-        # 2 — Which hospitals are affected by flooding
         "Which hospitals in Gujrat are affected by current flooding?",
-
-        # 3 — Vehicle passability
         "Can an ambulance reach DHQ Hospital in Gujrat?",
-
-        # 4 — Multi-step emergency scenario
         (
             "I'm at Gujrat Railway Station and need urgent medical help. "
-            "Find the nearest safe hospital and check if an ambulance can reach there."
+            "Find the nearest safe hospital and check if an ambulance can reach there. "
+            "Find nearest safe hospital and show me the route."
         ),
-
-        # 5 — Comparative recommendation
         (
             "Compare flood impact on hospitals in northern vs southern Gujrat "
             "and recommend which area has better emergency services access."
         ),
-
-        # 6 — Evacuation planning
         (
             "We need to evacuate patients from a flooded hospital. "
             "Find all accessible hospitals that can receive patients "
             "and check ambulance routes to each."
         ),
-
-        # 7 — Full road route with map
         (
             "Calculate the safest driving route from (32.5695347, 71.5695347) "
             "to DHQ Hospital and show me the map."
         ),
-
-        # 8 — Maximum complexity
         (
             "Emergency: Show all flooded areas, identify which hospitals need "
             "immediate evacuation, find safe hospitals for patient transfer, "
@@ -1089,7 +1028,7 @@ if __name__ == "__main__":
         ),
     ]
 
-    selected = 6  # change index 0-7 to run a different query
+    selected = 7  # change index 0-7 to run a different query
 
     print(f"\nExecuting Query {selected + 1}:")
     print(f"'{demo_queries[selected]}'\n")
