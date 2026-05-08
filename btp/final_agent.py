@@ -308,49 +308,115 @@ def get_flooded_areas() -> str:
         return f"Error reading flood zones: {e}"
 
 
+# ── Risk tier thresholds ──────────────────────────────────────────────────────
+_RISK_TIERS = [
+    (0.00, "NONE",     "No flood exposure"),
+    (0.10, "LOW",      "Shallow water — passable on foot, most vehicles"),
+    (0.30, "MODERATE", "Car limit reached — SUVs and trucks may pass"),
+    (0.60, "HIGH",     "Impassable for most vehicles — specialist only"),
+    (float("inf"), "CRITICAL", "Impassable — risk to life, do not attempt"),
+]
+
+def _depth_to_risk(depth: float) -> tuple[str, str]:
+    """Return (tier_label, tier_description) for a given flood depth."""
+    for threshold, label, desc in _RISK_TIERS:
+        if depth <= threshold:
+            return label, desc
+    return "CRITICAL", "Impassable — risk to life, do not attempt"
+
+
 @tool
-def check_route_flood_safety(
+def assess_path_flood_risk(
     start_lat: float, start_lon: float,
-    end_lat:   float, end_lon:   float
+    end_lat:   float, end_lon:   float,
+    steps:     int = 30
 ) -> str:
     """
-    Check whether a straight-line route between two points passes through flooded areas.
-    For a real road-network flood-aware route, use calculate_route instead.
+    Assess the flood risk along the straight-line corridor between two points.
+    Samples `steps + 1` evenly-spaced checkpoints, classifies each by flood
+    depth into a risk tier, and returns an overall risk rating with a breakdown.
+
+    Risk tiers (by max flood depth encountered):
+      NONE     : 0.00 m  — no flood exposure
+      LOW      : ≤ 0.10 m — passable on foot and by most vehicles
+      MODERATE : ≤ 0.30 m — car flood tolerance limit
+      HIGH     : ≤ 0.60 m — specialist/heavy vehicle only
+      CRITICAL : > 0.60 m — impassable, risk to life
+
+    NOTE: This scans a geometric straight line, not the actual road network.
+    Use calculate_route for a flood-avoiding route on real roads.
 
     Args:
-        start_lat / start_lon: Origin coordinates
-        end_lat   / end_lon  : Destination coordinates
+        start_lat / start_lon : Origin coordinates
+        end_lat   / end_lon   : Destination coordinates
+        steps                 : Number of intervals (default 30 → 31 checkpoints)
     """
     try:
-        points   = _route_points(start_lat, start_lon, end_lat, end_lon, steps=30)
-        flooded  = [(lat, lon, _flood_depth_at_point(lat, lon))
-                    for lat, lon in points
-                    if _flood_depth_at_point(lat, lon) > 0]
+        points = _route_points(start_lat, start_lon, end_lat, end_lon, steps=steps)
+        n_checkpoints = len(points)
 
-        safe      = len(flooded) == 0
+        # ── Sample every checkpoint ───────────────────────────────────────────
+        samples = [
+            (lat, lon, _flood_depth_at_point(lat, lon))
+            for lat, lon in points
+        ]
+
+        flooded   = [(lat, lon, d) for lat, lon, d in samples if d > 0]
         max_depth = max((d for _, _, d in flooded), default=0.0)
+        avg_depth = (sum(d for _, _, d in flooded) / len(flooded)) if flooded else 0.0
 
+        # ── Overall risk tier ─────────────────────────────────────────────────
+        overall_tier, overall_desc = _depth_to_risk(max_depth)
+
+        # ── Per-tier breakdown ────────────────────────────────────────────────
+        tier_counts: dict[str, int] = {"NONE": 0, "LOW": 0, "MODERATE": 0,
+                                        "HIGH": 0, "CRITICAL": 0}
+        for _, _, d in samples:
+            label, _ = _depth_to_risk(d)
+            tier_counts[label] += 1
+
+        # ── Recommendation ────────────────────────────────────────────────────
+        recommendations = {
+            "NONE":     "Corridor appears clear. Confirm on road network with calculate_route.",
+            "LOW":      "Minor flood exposure. Most vehicles can pass. Verify with calculate_route.",
+            "MODERATE": "Car flood tolerance exceeded. Use ambulance/truck or calculate_route to find an alternative.",
+            "HIGH":     "Specialist vehicles only. calculate_route strongly recommended for a safer road path.",
+            "CRITICAL": "DO NOT ATTEMPT. Immediately use calculate_route for a flood-avoiding road route.",
+        }
+
+        # ── Format output ─────────────────────────────────────────────────────
         result = (
-            f"Route Safety Analysis (straight-line check):\n"
-            f"  From : ({start_lat}, {start_lon})\n"
-            f"  To   : ({end_lat}, {end_lon})\n\n"
-            f"  Status          : {'SAFE' if safe else 'UNSAFE — crosses flood zone(s)'}\n"
-            f"  Flooded sections: {len(flooded)} / 31 checkpoints\n"
-            f"  Max flood depth : {max_depth:.2f} m\n"
+            f"Path Flood Risk Assessment (straight-line scan):\n"
+            f"  From         : ({start_lat}, {start_lon})\n"
+            f"  To           : ({end_lat}, {end_lon})\n"
+            f"  Checkpoints  : {n_checkpoints}\n\n"
+            f"  ┌─ OVERALL RISK : {overall_tier} ─────────────────┐\n"
+            f"  │  {overall_desc:<42}│\n"
+            f"  └──────────────────────────────────────────────────┘\n\n"
+            f"  Max flood depth  : {max_depth:.2f} m\n"
+            f"  Avg flood depth  : {avg_depth:.2f} m  (flooded checkpoints only)\n"
+            f"  Flooded sections : {len(flooded)} / {n_checkpoints} checkpoints "
+            f"({100 * len(flooded) / n_checkpoints:.0f}%)\n\n"
+            f"  Risk tier breakdown:\n"
         )
 
-        if not safe:
-            result += "\n  Flooded checkpoints (first 5):\n"
-            for lat, lon, depth in flooded[:5]:
-                result += f"    - ({lat:.5f}, {lon:.5f}): {depth:.2f} m\n"
-            result += "\n  Recommendation: Use calculate_route for a flood-avoiding road route.\n"
-        else:
-            result += "\n  Recommendation: Route appears clear. Use calculate_route to confirm on road network.\n"
+        for tier in ["NONE", "LOW", "MODERATE", "HIGH", "CRITICAL"]:
+            count = tier_counts[tier]
+            bar   = "█" * count + "░" * (n_checkpoints - count)
+            result += f"    {tier:<10}: {count:>3} pts  {bar[:20]}\n"
 
+        if flooded:
+            result += f"\n  Worst checkpoints (up to 3):\n"
+            worst = sorted(flooded, key=lambda x: x[2], reverse=True)[:3]
+            for lat, lon, depth in worst:
+                tier_label, _ = _depth_to_risk(depth)
+                result += f"    - ({lat:.5f}, {lon:.5f}): {depth:.2f} m  [{tier_label}]\n"
+
+        result += f"\n  Recommendation: {recommendations[overall_tier]}\n"
         return result
 
     except Exception as e:
-        return f"Error checking route flood safety: {e}"
+        return f"Error assessing path flood risk: {e}"
 
 
 @tool
@@ -650,7 +716,7 @@ TOOLS_MAP = {
     "get_city_bbox":                 get_city_bbox,
     "check_flood_depth":             check_flood_depth,
     "get_flooded_areas":             get_flooded_areas,
-    "check_route_flood_safety":      check_route_flood_safety,
+    "assess_path_flood_risk":        assess_path_flood_risk,
     "check_amenity_flood_status":    check_amenity_flood_status,
     "check_vehicle_passability":     check_vehicle_passability,
     "calculate_route":               calculate_route,
@@ -693,7 +759,7 @@ AVAILABLE TOOLS:
   3.  get_city_bbox                 — get bounding box for a city
   4.  check_flood_depth             — real flood depth at coordinates (shapefile)
   5.  get_flooded_areas             — list all flood zones from the shapefile
-  6.  check_route_flood_safety      — straight-line route flood check (shapefile)
+  6.  assess_path_flood_risk        — straight-line corridor flood risk assessment with per-tier breakdown (NONE / LOW / MODERATE / HIGH / CRITICAL). Not a road route. Use calculate_route for real road-network routing.
   7.  check_amenity_flood_status    — check which facilities are in flood zones
   8.  check_vehicle_passability     — check if a vehicle can pass given flood depth
   9.  calculate_route               — K shortest flood-aware routes on real road network
