@@ -32,13 +32,7 @@ class _RoadGraphCache:
     def __init__(self):
         self._cache: dict = {}
 
-    def get(
-        self,
-        place: str,
-        file_name: str,
-        vehicle_type: str,
-        vehicle_config: dict,
-    ) -> tuple:
+    def get(self,place: str,file_name: str,vehicle_type: str,vehicle_config: dict,) -> tuple:
         """
         Return (G, G_simple, edges_gdf) for the given place + vehicle_type,
         building and caching them on first call.
@@ -52,13 +46,7 @@ class _RoadGraphCache:
             print(f"[RoadGraphCache] Cache hit for key {key}.")
         return self._cache[key]
 
-    def _build(
-        self,
-        place: str,
-        file_name: str,
-        vehicle_type: str,
-        vehicle_config: dict,
-    ) -> tuple:
+    def _build(self,place: str,file_name: str,vehicle_type: str,vehicle_config: dict,) -> tuple:
         # ── 1. Download road network ──────────────────────────────────────
         G = ox.graph_from_place(place, network_type="drive")
 
@@ -225,11 +213,7 @@ def yen_k_shortest(G, G_simple, vehicle, vehicle_config, source, target, k=1, we
 # PUBLIC API
 # ============================================================================
 
-def get_shortest_path(
-    lat1, lon1, lat2, lon2,
-    token,
-    place="Gujrat,Pakistan",
-    file_name=r"E:\EMSR838_products\EMSR838_AOI01_DEL_PRODUCT_v1\EMSR838_AOI01_DEL_PRODUCT_floodDepthA_v1.shp",
+def get_shortest_path(lat1, lon1, lat2, lon2,token,place="Gujrat,Pakistan",file_name=r"E:\EMSR838_products\EMSR838_AOI01_DEL_PRODUCT_v1\EMSR838_AOI01_DEL_PRODUCT_floodDepthA_v1.shp",
     k=3,
     vehicle_type="car",
     vehicle_config=vechile_config,
